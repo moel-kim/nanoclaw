@@ -67,6 +67,7 @@ let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+let activeThreadTs: Record<string, string | undefined> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
@@ -186,6 +187,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const previousCursor = lastAgentTimestamp[chatJid] || '';
   lastAgentTimestamp[chatJid] =
     missedMessages[missedMessages.length - 1].timestamp;
+  activeThreadTs[chatJid] =
+    missedMessages[missedMessages.length - 1].thread_ts;
   saveState();
 
   logger.info(
@@ -222,7 +225,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await channel.sendMessage(chatJid, text, { thread_ts: activeThreadTs[chatJid] });
+        if (!outputSentToUser) {
+          // Remove loading indicator after first response is sent
+          await channel.setTyping?.(chatJid, false);
+        }
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -426,6 +433,8 @@ async function startMessageLoop(): Promise<void> {
             );
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
+            activeThreadTs[chatJid] =
+              messagesToSend[messagesToSend.length - 1].thread_ts;
             saveState();
             // Show typing indicator while the container processes the piped message
             channel
@@ -617,7 +626,7 @@ async function main(): Promise<void> {
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      return channel.sendMessage(jid, text, { thread_ts: activeThreadTs[jid] });
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
