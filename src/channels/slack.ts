@@ -3,11 +3,12 @@ import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
-import { readEnvFile } from '../env.js';
+import { readEnvFile, readEnvFileByPrefix } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  SendMessageOptions,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
@@ -22,6 +23,14 @@ const MAX_MESSAGE_LENGTH = 4000;
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
 type HandledMessageEvent = GenericMessageEvent | BotMessageEvent;
 
+/** A Slack App identity — one per agent (or one default shared by all). */
+interface SlackIdentity {
+  key: string; // 'default' | 'RESEARCHER' | 'OPS' etc.
+  app: App;
+  botUserId: string;
+  botToken: string;
+}
+
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -31,13 +40,23 @@ export interface SlackChannelOpts {
 export class SlackChannel implements Channel {
   name = 'slack';
 
-  private app: App;
-  private botUserId: string | undefined;
+  // Multi-identity: key → identity. 'default' always exists.
+  private identities = new Map<string, SlackIdentity>();
+  private defaultIdentity!: SlackIdentity;
+  // Maps agentFolder → identity key (built from registeredGroups + slackIdentity field)
+  private folderToIdentityKey = new Map<string, string>();
+  // Maps botUserId → identity key (for mention detection)
+  private botUserIdToIdentityKey = new Map<string, string>();
+  // Dedup messages across identities (each App in the same channel receives the same message)
+  private seenMessages = new Set<string>();
+  private seenMessagesTrimTimer: ReturnType<typeof setInterval> | null = null;
+
   private connected = false;
   private outgoingQueue: Array<{
     jid: string;
     text: string;
     thread_ts?: string;
+    agentFolder?: string;
   }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
@@ -48,46 +67,89 @@ export class SlackChannel implements Channel {
   constructor(opts: SlackChannelOpts) {
     this.opts = opts;
 
-    // Read tokens from .env (not process.env — keeps secrets off the environment
-    // so they don't leak to child processes, matching NanoClaw's security pattern)
+    // Read default tokens
     const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
-    const botToken = env.SLACK_BOT_TOKEN;
-    const appToken = env.SLACK_APP_TOKEN;
+    const defaultBotToken = env.SLACK_BOT_TOKEN;
+    const defaultAppToken = env.SLACK_APP_TOKEN;
 
-    if (!botToken || !appToken) {
+    if (!defaultBotToken || !defaultAppToken) {
       throw new Error(
         'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env',
       );
     }
 
-    this.app = new App({
-      token: botToken,
-      appToken,
+    // Create default identity
+    const defaultApp = new App({
+      token: defaultBotToken,
+      appToken: defaultAppToken,
       socketMode: true,
       logLevel: LogLevel.ERROR,
     });
+    this.identities.set('default', {
+      key: 'default',
+      app: defaultApp,
+      botUserId: '',
+      botToken: defaultBotToken,
+    });
 
-    this.setupEventHandlers();
+    // Discover per-agent identities (SLACK_BOT_TOKEN_RESEARCHER, etc.)
+    const suffixedBotTokens = readEnvFileByPrefix('SLACK_BOT_TOKEN');
+    const suffixedAppTokens = readEnvFileByPrefix('SLACK_APP_TOKEN');
+
+    for (const [suffix, botToken] of Object.entries(suffixedBotTokens)) {
+      const appToken = suffixedAppTokens[suffix];
+      if (!appToken) {
+        logger.warn(
+          { suffix },
+          `SLACK_BOT_TOKEN_${suffix} found but no matching SLACK_APP_TOKEN_${suffix}, skipping`,
+        );
+        continue;
+      }
+
+      const app = new App({
+        token: botToken,
+        appToken,
+        socketMode: true,
+        logLevel: LogLevel.ERROR,
+      });
+      this.identities.set(suffix, {
+        key: suffix,
+        app,
+        botUserId: '',
+        botToken: botToken,
+      });
+      logger.info({ suffix }, 'Slack identity discovered');
+    }
+
+    // Set up event handlers on all identities
+    for (const identity of this.identities.values()) {
+      this.setupEventHandlers(identity);
+    }
+
+    this.defaultIdentity = this.identities.get('default')!;
+
+    // Periodically trim the seenMessages set to prevent unbounded growth
+    this.seenMessagesTrimTimer = setInterval(
+      () => {
+        this.seenMessages.clear();
+      },
+      5 * 60 * 1000,
+    ); // Every 5 minutes
   }
 
-  private setupEventHandlers(): void {
-    // Use app.event('message') instead of app.message() to capture all
-    // message subtypes including bot_message (needed to track our own output)
-    this.app.event('message', async ({ event }) => {
-      // Bolt's event type is the full MessageEvent union (17+ subtypes).
-      // We filter on subtype first, then narrow to the two types we handle.
+  private setupEventHandlers(identity: SlackIdentity): void {
+    identity.app.event('message', async ({ event }) => {
       const subtype = (event as { subtype?: string }).subtype;
       if (subtype && subtype !== 'bot_message') return;
 
-      // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
-
       if (!msg.text) return;
 
+      // Dedup across identities: each App in the same channel gets the same event
+      if (this.seenMessages.has(msg.ts)) return;
+      this.seenMessages.add(msg.ts);
+
       const jid = `slack:${msg.channel}`;
-      // For thread replies, use the existing thread_ts (parent message).
-      // For channel-level messages, use the message's own ts so the bot
-      // always replies in a thread (keeps the channel clean).
       const threadTs = (msg as GenericMessageEvent).thread_ts || msg.ts;
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
@@ -99,7 +161,10 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
+      // Check if this message is from ANY of our bot identities
+      const isBotMessage =
+        !!msg.bot_id ||
+        this.botUserIdToIdentityKey.has(msg.user || '');
 
       // Track user message ts queue for reaction-based typing indicator
       if (!isBotMessage) {
@@ -119,13 +184,26 @@ export class SlackChannel implements Channel {
       }
 
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
-      // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
-      // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
+      // Check all bot identities for mentions.
       let content = msg.text;
-      if (this.botUserId && !isBotMessage) {
-        const mentionPattern = `<@${this.botUserId}>`;
+      if (!isBotMessage) {
+        for (const [botUserId, identityKey] of this.botUserIdToIdentityKey) {
+          const mentionPattern = `<@${botUserId}>`;
+          if (content.includes(mentionPattern)) {
+            // Find the agent name for this identity
+            const ident = this.identities.get(identityKey);
+            const agentName = this.resolveAgentNameForIdentity(identityKey);
+            if (agentName && !TRIGGER_PATTERN.test(content)) {
+              content = `@${agentName} ${content}`;
+            }
+            break; // Only prepend one trigger
+          }
+        }
+        // Fallback: check default bot mention (backwards compat)
         if (
-          content.includes(mentionPattern) &&
+          this.defaultIdentity.botUserId &&
+          content === msg.text && // No mention was handled above
+          content.includes(`<@${this.defaultIdentity.botUserId}>`) &&
           !TRIGGER_PATTERN.test(content)
         ) {
           content = `@${ASSISTANT_NAME} ${content}`;
@@ -147,38 +225,96 @@ export class SlackChannel implements Channel {
   }
 
   async connect(): Promise<void> {
-    await this.app.start();
-
-    // Get bot's own user ID for self-message detection.
-    // Resolve this BEFORE setting connected=true so that messages arriving
-    // during startup can correctly detect bot-sent messages.
-    try {
-      const auth = await this.app.client.auth.test();
-      this.botUserId = auth.user_id as string;
-      logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
-    } catch (err) {
-      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
-    }
+    // Connect all identities in parallel
+    const connectPromises = [...this.identities.values()].map(
+      async (identity) => {
+        await identity.app.start();
+        try {
+          const auth = await identity.app.client.auth.test();
+          identity.botUserId = auth.user_id as string;
+          this.botUserIdToIdentityKey.set(identity.botUserId, identity.key);
+          logger.info(
+            {
+              identity: identity.key,
+              botUserId: identity.botUserId,
+            },
+            'Slack identity connected',
+          );
+        } catch (err) {
+          logger.warn(
+            { identity: identity.key, err },
+            'Connected to Slack but failed to get bot user ID',
+          );
+        }
+      },
+    );
+    await Promise.all(connectPromises);
 
     this.connected = true;
+
+    // Build folder → identity mapping from registered groups
+    this.rebuildFolderMapping();
 
     // Flush any messages queued before connection
     await this.flushOutgoingQueue();
 
-    // Sync channel names on startup
+    // Sync channel names on startup (using default identity)
     await this.syncChannelMetadata();
+  }
+
+  /**
+   * Rebuild the agentFolder → identityKey mapping from registered groups.
+   * Called at startup and should be called when groups change.
+   */
+  private rebuildFolderMapping(): void {
+    this.folderToIdentityKey.clear();
+    const groups = this.opts.registeredGroups();
+    for (const group of Object.values(groups)) {
+      if (group.slackIdentity && this.identities.has(group.slackIdentity)) {
+        this.folderToIdentityKey.set(group.folder, group.slackIdentity);
+      }
+    }
+  }
+
+  /** Resolve the agent name for a given identity key by searching registered groups. */
+  private resolveAgentNameForIdentity(identityKey: string): string | undefined {
+    const groups = this.opts.registeredGroups();
+    for (const group of Object.values(groups)) {
+      if (group.slackIdentity === identityKey && group.assistantName) {
+        return group.assistantName;
+      }
+    }
+    return undefined;
+  }
+
+  /** Get the App client for a given agent folder, falling back to default. */
+  private getClientForAgent(agentFolder?: string): App {
+    if (agentFolder) {
+      const identityKey = this.folderToIdentityKey.get(agentFolder);
+      if (identityKey) {
+        const identity = this.identities.get(identityKey);
+        if (identity) return identity.app;
+      }
+    }
+    return this.defaultIdentity.app;
   }
 
   async sendMessage(
     jid: string,
     text: string,
-    options?: { thread_ts?: string },
+    options?: SendMessageOptions,
   ): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
     const threadTs = options?.thread_ts;
+    const client = this.getClientForAgent(options?.agentFolder);
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text, thread_ts: threadTs });
+      this.outgoingQueue.push({
+        jid,
+        text,
+        thread_ts: threadTs,
+        agentFolder: options?.agentFolder,
+      });
       logger.info(
         { jid, queueSize: this.outgoingQueue.length },
         'Slack disconnected, message queued',
@@ -189,23 +325,31 @@ export class SlackChannel implements Channel {
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({
+        await client.client.chat.postMessage({
           channel: channelId,
           text,
           thread_ts: threadTs,
         });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-          await this.app.client.chat.postMessage({
+          await client.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
             thread_ts: threadTs,
           });
         }
       }
-      logger.info({ jid, length: text.length, threadTs }, 'Slack message sent');
+      logger.info(
+        { jid, length: text.length, threadTs, agentFolder: options?.agentFolder },
+        'Slack message sent',
+      );
     } catch (err) {
-      this.outgoingQueue.push({ jid, text, thread_ts: threadTs });
+      this.outgoingQueue.push({
+        jid,
+        text,
+        thread_ts: threadTs,
+        agentFolder: options?.agentFolder,
+      });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
@@ -223,7 +367,14 @@ export class SlackChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
-    await this.app.stop();
+    if (this.seenMessagesTrimTimer) {
+      clearInterval(this.seenMessagesTrimTimer);
+      this.seenMessagesTrimTimer = null;
+    }
+    // Stop all identities
+    await Promise.all(
+      [...this.identities.values()].map((i) => i.app.stop()),
+    );
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -235,15 +386,16 @@ export class SlackChannel implements Channel {
       return;
     }
 
+    // Use default identity for reactions (reactions show the app name regardless)
     try {
       if (isTyping) {
-        await this.app.client.reactions.add({
+        await this.defaultIdentity.app.client.reactions.add({
           channel: channelId,
           timestamp: messageTs,
           name: 'ai-loading',
         });
       } else {
-        await this.app.client.reactions.remove({
+        await this.defaultIdentity.app.client.reactions.remove({
           channel: channelId,
           timestamp: messageTs,
           name: 'ai-loading',
@@ -251,7 +403,10 @@ export class SlackChannel implements Channel {
         tsQueue?.shift(); // Advance to next message's reaction target
       }
     } catch (err) {
-      logger.warn({ jid, isTyping, messageTs, err }, 'setTyping reaction failed');
+      logger.warn(
+        { jid, isTyping, messageTs, err },
+        'setTyping reaction failed',
+      );
     }
   }
 
@@ -266,12 +421,13 @@ export class SlackChannel implements Channel {
       let count = 0;
 
       do {
-        const result = await this.app.client.conversations.list({
-          types: 'public_channel,private_channel',
-          exclude_archived: true,
-          limit: 200,
-          cursor,
-        });
+        const result =
+          await this.defaultIdentity.app.client.conversations.list({
+            types: 'public_channel,private_channel',
+            exclude_archived: true,
+            limit: 200,
+            cursor,
+          });
 
         for (const ch of result.channels || []) {
           if (ch.id && ch.name && ch.is_member) {
@@ -296,7 +452,9 @@ export class SlackChannel implements Channel {
     if (cached) return cached;
 
     try {
-      const result = await this.app.client.users.info({ user: userId });
+      const result = await this.defaultIdentity.app.client.users.info({
+        user: userId,
+      });
       const name = result.user?.real_name || result.user?.name;
       if (name) this.userNameCache.set(userId, name);
       return name;
@@ -317,7 +475,8 @@ export class SlackChannel implements Channel {
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
         const channelId = item.jid.replace(/^slack:/, '');
-        await this.app.client.chat.postMessage({
+        const client = this.getClientForAgent(item.agentFolder);
+        await client.client.chat.postMessage({
           channel: channelId,
           text: item.text,
           thread_ts: item.thread_ts,

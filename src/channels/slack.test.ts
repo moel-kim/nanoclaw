@@ -80,6 +80,7 @@ vi.mock('../env.js', () => ({
     SLACK_BOT_TOKEN: 'xoxb-test-token',
     SLACK_APP_TOKEN: 'xapp-test-token',
   }),
+  readEnvFileByPrefix: vi.fn().mockReturnValue({}),
 }));
 
 import { SlackChannel, SlackChannelOpts } from './slack.js';

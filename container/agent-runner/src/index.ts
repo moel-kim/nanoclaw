@@ -27,6 +27,12 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  memoryProvider?: {
+    type: string;
+    apiUrl: string;
+    apiKey: string;
+    agentId?: string;
+  };
 }
 
 interface ContainerOutput {
@@ -325,6 +331,43 @@ function waitForIpcMessage(): Promise<string | null> {
 
 /**
  * Run a single query and stream results via writeOutput.
+ * Build MCP servers config, conditionally including memory if configured.
+ */
+function buildMcpServers(
+  mcpServerPath: string,
+  containerInput: ContainerInput,
+): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
+  const servers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+  };
+
+  if (containerInput.memoryProvider?.apiUrl) {
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const memoryMcpPath = path.join(__dirname, 'memory-mcp-stdio.js');
+    servers.memory = {
+      command: 'node',
+      args: [memoryMcpPath],
+      env: {
+        NANOCLAW_MEMORY_TYPE: containerInput.memoryProvider.type || 'custom',
+        NANOCLAW_MEMORY_API_URL: containerInput.memoryProvider.apiUrl,
+        NANOCLAW_MEMORY_API_KEY: containerInput.memoryProvider.apiKey || '',
+        NANOCLAW_MEMORY_AGENT_ID: containerInput.memoryProvider.agentId || containerInput.groupFolder,
+      },
+    };
+  }
+
+  return servers;
+}
+
+/**
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
@@ -407,23 +450,14 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        ...(containerInput.memoryProvider?.apiUrl ? ['mcp__memory__*'] : []),
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
+      mcpServers: buildMcpServers(mcpServerPath, containerInput),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },

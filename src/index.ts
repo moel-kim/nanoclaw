@@ -10,6 +10,7 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -58,6 +59,12 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import {
+  CascadeTriageStrategy,
+  loadThreadAffinity,
+  saveThreadAffinity,
+  TriageContext,
+} from './triage.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -78,6 +85,18 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const cascadeTriage = new CascadeTriageStrategy();
+let triageContext: TriageContext | null = null;
+
+function getTriageContext(): TriageContext {
+  if (!triageContext) {
+    triageContext = {
+      threadOwnership: loadThreadAffinity(),
+      botUserIds: new Map(),
+    };
+  }
+  return triageContext;
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -184,7 +203,10 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
   const chatJid = group.jid!;
   const channel = findChannel(channels, chatJid);
   if (!channel) {
-    logger.warn({ chatJid, agentFolder }, 'No channel owns JID, skipping messages');
+    logger.warn(
+      { chatJid, agentFolder },
+      'No channel owns JID, skipping messages',
+    );
     return true;
   }
 
@@ -192,11 +214,7 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
   const agentName = group.assistantName || ASSISTANT_NAME;
 
   const sinceTimestamp = lastAgentTimestamp[agentFolder] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    agentName,
-  );
+  const missedMessages = getMessagesSince(chatJid, sinceTimestamp, agentName);
 
   if (missedMessages.length === 0) return true;
 
@@ -263,6 +281,12 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
         });
         // Remove loading indicator after response is sent
         await channel.setTyping?.(chatJid, false);
+        // Record thread affinity so future messages in this thread route to this agent
+        const currentThreadTs = threadTsQueue[agentFolder]?.[0];
+        if (currentThreadTs && !outputSentToUser) {
+          getTriageContext().threadOwnership.set(currentThreadTs, agentFolder);
+          saveThreadAffinity(getTriageContext().threadOwnership);
+        }
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -361,7 +385,17 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        assistantName: ASSISTANT_NAME,
+        assistantName: group.assistantName || ASSISTANT_NAME,
+        memoryProvider: group.memoryProvider
+          ? {
+              type: group.memoryProvider.type,
+              apiUrl: group.memoryProvider.apiUrl,
+              apiKey: readEnvFile([group.memoryProvider.apiKeyEnvVar])[
+                group.memoryProvider.apiKeyEnvVar
+              ] || '',
+              agentId: group.memoryProvider.agentId,
+            }
+          : undefined,
       },
       (proc, containerName) =>
         queue.registerProcess(group.folder, proc, containerName),
@@ -434,17 +468,14 @@ async function startMessageLoop(): Promise<void> {
             continue;
           }
 
-          // Dispatch to each agent registered for this JID
-          for (const agent of agents) {
-            const agentFolder = agent.folder;
+          // Determine which agents should handle these messages
+          let targetAgents: RegisteredGroup[];
+          if (agents.length === 1) {
+            // Fast path: single agent, use existing trigger logic
+            const agent = agents[0];
             const isMainGroup = agent.isMain === true;
             const needsTrigger =
               !isMainGroup && agent.requiresTrigger !== false;
-            const agentName = agent.assistantName || ASSISTANT_NAME;
-
-            // For non-main groups, only act on trigger messages.
-            // Non-trigger messages accumulate in DB and get pulled as
-            // context when a trigger eventually arrives.
             if (needsTrigger) {
               const allowlistCfg = loadSenderAllowlist();
               const hasTrigger = groupMessages.some(
@@ -455,6 +486,36 @@ async function startMessageLoop(): Promise<void> {
               );
               if (!hasTrigger) continue;
             }
+            targetAgents = [agent];
+          } else {
+            // Multi-agent: run triage cascade
+            const lastMsg = groupMessages[groupMessages.length - 1];
+            const triageResult = await cascadeTriage.triage(
+              lastMsg,
+              agents,
+              getTriageContext(),
+            );
+            if (!triageResult || triageResult.matchedAgents.length === 0) {
+              continue; // No agent matched
+            }
+            logger.info(
+              {
+                chatJid,
+                matched: triageResult.matchedAgents,
+                reason: triageResult.reason,
+                strategy: triageResult.strategy,
+              },
+              'Triage result',
+            );
+            targetAgents = agents.filter((a) =>
+              triageResult.matchedAgents.includes(a.folder),
+            );
+          }
+
+          // Dispatch to matched agents
+          for (const agent of targetAgents) {
+            const agentFolder = agent.folder;
+            const agentName = agent.assistantName || ASSISTANT_NAME;
 
             // Pull all messages since this agent's lastAgentTimestamp so non-trigger
             // context that accumulated between triggers is included.

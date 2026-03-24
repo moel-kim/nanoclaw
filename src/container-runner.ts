@@ -41,6 +41,12 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  memoryProvider?: {
+    type: string;
+    apiUrl: string;
+    apiKey: string;
+    agentId?: string;
+  };
 }
 
 export interface ContainerOutput {
