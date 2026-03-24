@@ -246,17 +246,7 @@ export class CascadeTriageStrategy implements TriageStrategy {
       }
     }
 
-    // Fallback: route to isMain agent if one exists
-    const mainAgent = agents.find((a) => a.isMain);
-    if (mainAgent) {
-      return {
-        matchedAgents: [mainAgent.folder],
-        reason: 'Fallback to main agent',
-        strategy: 'fallback',
-      };
-    }
-
-    return null; // No match
+    return null; // No match — require explicit @mention or keyword
   }
 }
 

@@ -190,7 +190,7 @@ describe('CascadeTriageStrategy', () => {
     expect(result!.strategy).toBe('explicit'); // Not 'keyword'
   });
 
-  it('falls back to main agent when nothing matches', async () => {
+  it('returns null when nothing matches (no fallback)', async () => {
     const agents = [
       makeAgent({ folder: 'agent_a', triageKeywords: ['specific'] }),
       makeAgent({ folder: 'main_agent', isMain: true }),
@@ -204,9 +204,7 @@ describe('CascadeTriageStrategy', () => {
     const cascade = new CascadeTriageStrategy();
     const result = await cascade.triage(msg, agents, context);
 
-    expect(result).not.toBeNull();
-    expect(result!.matchedAgents).toEqual(['main_agent']);
-    expect(result!.strategy).toBe('fallback');
+    expect(result).toBeNull();
   });
 });
 

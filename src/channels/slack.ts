@@ -290,7 +290,9 @@ export class SlackChannel implements Channel {
 
   /** Get all agents from allAgents() or fall back to registeredGroups(). */
   private getAllAgents(): RegisteredGroup[] {
-    return this.opts.allAgents?.() || Object.values(this.opts.registeredGroups());
+    return (
+      this.opts.allAgents?.() || Object.values(this.opts.registeredGroups())
+    );
   }
 
   /**

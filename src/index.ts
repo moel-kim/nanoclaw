@@ -220,7 +220,12 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
   const missedMessages = getMessagesSince(chatJid, sinceTimestamp, agentName);
 
   logger.info(
-    { agentFolder, chatJid, sinceTimestamp, messageCount: missedMessages.length },
+    {
+      agentFolder,
+      chatJid,
+      sinceTimestamp,
+      messageCount: missedMessages.length,
+    },
     'processGroupMessages: fetched messages',
   );
 
@@ -230,12 +235,17 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
   if (!isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
     // Use per-agent trigger pattern if the agent has its own name
-    const triggerPattern = agentName !== ASSISTANT_NAME
-      ? new RegExp(`^@${agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
-      : TRIGGER_PATTERN;
+    const triggerPattern =
+      agentName !== ASSISTANT_NAME
+        ? new RegExp(
+            `^@${agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+            'i',
+          )
+        : TRIGGER_PATTERN;
     const hasTrigger = missedMessages.some(
       (m) =>
-        (TRIGGER_PATTERN.test(m.content.trim()) || triggerPattern.test(m.content.trim())) &&
+        (TRIGGER_PATTERN.test(m.content.trim()) ||
+          triggerPattern.test(m.content.trim())) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;

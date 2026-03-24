@@ -185,7 +185,9 @@ function createSchema(database: Database.Database): void {
         CREATE INDEX IF NOT EXISTS idx_rg_folder ON registered_groups(folder);
         CREATE INDEX IF NOT EXISTS idx_rg_jid ON registered_groups(jid);
       `);
-      logger.info('Migrated registered_groups to composite primary key (jid, folder)');
+      logger.info(
+        'Migrated registered_groups to composite primary key (jid, folder)',
+      );
     }
   } catch (err) {
     logger.error({ err }, 'Failed to migrate registered_groups schema');
@@ -200,9 +202,7 @@ function createSchema(database: Database.Database): void {
     'memory_provider TEXT',
   ]) {
     try {
-      database.exec(
-        `ALTER TABLE registered_groups ADD COLUMN ${col}`,
-      );
+      database.exec(`ALTER TABLE registered_groups ADD COLUMN ${col}`);
     } catch {
       /* column already exists */
     }
@@ -743,9 +743,7 @@ export function getAgentsForJid(jid: string): RegisteredGroup[] {
   const rows = db
     .prepare('SELECT * FROM registered_groups WHERE jid = ?')
     .all(jid) as RegisteredGroupRow[];
-  return rows
-    .filter((row) => isValidGroupFolder(row.folder))
-    .map(rowToGroup);
+  return rows.filter((row) => isValidGroupFolder(row.folder)).map(rowToGroup);
 }
 
 /** Builds dual-index maps for fast lookup by folder and by JID. */

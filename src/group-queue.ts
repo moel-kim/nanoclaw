@@ -221,10 +221,7 @@ export class GroupQueue {
         }
       }
     } catch (err) {
-      logger.error(
-        { agentFolder, err },
-        'Error processing messages for group',
-      );
+      logger.error({ agentFolder, err }, 'Error processing messages for group');
       this.scheduleRetry(agentFolder, state);
     } finally {
       state.active = false;
@@ -235,10 +232,7 @@ export class GroupQueue {
     }
   }
 
-  private async runTask(
-    agentFolder: string,
-    task: QueuedTask,
-  ): Promise<void> {
+  private async runTask(agentFolder: string, task: QueuedTask): Promise<void> {
     const state = this.getGroup(agentFolder);
     state.active = true;
     state.idleWaiting = false;
@@ -254,10 +248,7 @@ export class GroupQueue {
     try {
       await task.fn();
     } catch (err) {
-      logger.error(
-        { agentFolder, taskId: task.id, err },
-        'Error running task',
-      );
+      logger.error({ agentFolder, taskId: task.id, err }, 'Error running task');
     } finally {
       state.active = false;
       state.isTaskContainer = false;
