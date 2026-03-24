@@ -35,6 +35,7 @@ export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  allAgents?: () => RegisteredGroup[];
 }
 
 export class SlackChannel implements Channel {
@@ -163,8 +164,7 @@ export class SlackChannel implements Channel {
 
       // Check if this message is from ANY of our bot identities
       const isBotMessage =
-        !!msg.bot_id ||
-        this.botUserIdToIdentityKey.has(msg.user || '');
+        !!msg.bot_id || this.botUserIdToIdentityKey.has(msg.user || '');
 
       // Track user message ts queue for reaction-based typing indicator
       if (!isBotMessage) {
@@ -263,25 +263,54 @@ export class SlackChannel implements Channel {
   }
 
   /**
+   * Returns botUserId → agentFolder mapping for triage @mention detection.
+   * Maps each identity's bot user ID to the agent folder that uses it.
+   */
+  getBotUserMappings(): Map<string, string> {
+    const result = new Map<string, string>();
+    const agents = this.getAllAgents();
+    for (const agent of agents) {
+      if (agent.slackIdentity) {
+        const identity = this.identities.get(agent.slackIdentity);
+        if (identity?.botUserId) {
+          result.set(identity.botUserId, agent.folder);
+        }
+      }
+    }
+    // Default identity maps to any agent without a specific slackIdentity
+    if (this.defaultIdentity.botUserId) {
+      for (const agent of agents) {
+        if (!agent.slackIdentity) {
+          result.set(this.defaultIdentity.botUserId, agent.folder);
+        }
+      }
+    }
+    return result;
+  }
+
+  /** Get all agents from allAgents() or fall back to registeredGroups(). */
+  private getAllAgents(): RegisteredGroup[] {
+    return this.opts.allAgents?.() || Object.values(this.opts.registeredGroups());
+  }
+
+  /**
    * Rebuild the agentFolder → identityKey mapping from registered groups.
    * Called at startup and should be called when groups change.
    */
   private rebuildFolderMapping(): void {
     this.folderToIdentityKey.clear();
-    const groups = this.opts.registeredGroups();
-    for (const group of Object.values(groups)) {
-      if (group.slackIdentity && this.identities.has(group.slackIdentity)) {
-        this.folderToIdentityKey.set(group.folder, group.slackIdentity);
+    for (const agent of this.getAllAgents()) {
+      if (agent.slackIdentity && this.identities.has(agent.slackIdentity)) {
+        this.folderToIdentityKey.set(agent.folder, agent.slackIdentity);
       }
     }
   }
 
   /** Resolve the agent name for a given identity key by searching registered groups. */
   private resolveAgentNameForIdentity(identityKey: string): string | undefined {
-    const groups = this.opts.registeredGroups();
-    for (const group of Object.values(groups)) {
-      if (group.slackIdentity === identityKey && group.assistantName) {
-        return group.assistantName;
+    for (const agent of this.getAllAgents()) {
+      if (agent.slackIdentity === identityKey && agent.assistantName) {
+        return agent.assistantName;
       }
     }
     return undefined;
@@ -340,7 +369,12 @@ export class SlackChannel implements Channel {
         }
       }
       logger.info(
-        { jid, length: text.length, threadTs, agentFolder: options?.agentFolder },
+        {
+          jid,
+          length: text.length,
+          threadTs,
+          agentFolder: options?.agentFolder,
+        },
         'Slack message sent',
       );
     } catch (err) {
@@ -372,9 +406,7 @@ export class SlackChannel implements Channel {
       this.seenMessagesTrimTimer = null;
     }
     // Stop all identities
-    await Promise.all(
-      [...this.identities.values()].map((i) => i.app.stop()),
-    );
+    await Promise.all([...this.identities.values()].map((i) => i.app.stop()));
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -421,13 +453,14 @@ export class SlackChannel implements Channel {
       let count = 0;
 
       do {
-        const result =
-          await this.defaultIdentity.app.client.conversations.list({
+        const result = await this.defaultIdentity.app.client.conversations.list(
+          {
             types: 'public_channel,private_channel',
             exclude_archived: true,
             limit: 200,
             cursor,
-          });
+          },
+        );
 
         for (const ch of result.channels || []) {
           if (ch.id && ch.name && ch.is_member) {

@@ -198,7 +198,10 @@ export function _setRegisteredGroups(
  */
 async function processGroupMessages(agentFolder: string): Promise<boolean> {
   const group = agentsByFolder.get(agentFolder);
-  if (!group) return true;
+  if (!group) {
+    logger.warn({ agentFolder }, 'processGroupMessages: agent not found');
+    return true;
+  }
 
   const chatJid = group.jid!;
   const channel = findChannel(channels, chatJid);
@@ -216,14 +219,23 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
   const sinceTimestamp = lastAgentTimestamp[agentFolder] || '';
   const missedMessages = getMessagesSince(chatJid, sinceTimestamp, agentName);
 
+  logger.info(
+    { agentFolder, chatJid, sinceTimestamp, messageCount: missedMessages.length },
+    'processGroupMessages: fetched messages',
+  );
+
   if (missedMessages.length === 0) return true;
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
+    // Use per-agent trigger pattern if the agent has its own name
+    const triggerPattern = agentName !== ASSISTANT_NAME
+      ? new RegExp(`^@${agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+      : TRIGGER_PATTERN;
     const hasTrigger = missedMessages.some(
       (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
+        (TRIGGER_PATTERN.test(m.content.trim()) || triggerPattern.test(m.content.trim())) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
@@ -390,9 +402,10 @@ async function runAgent(
           ? {
               type: group.memoryProvider.type,
               apiUrl: group.memoryProvider.apiUrl,
-              apiKey: readEnvFile([group.memoryProvider.apiKeyEnvVar])[
-                group.memoryProvider.apiKeyEnvVar
-              ] || '',
+              apiKey:
+                readEnvFile([group.memoryProvider.apiKeyEnvVar])[
+                  group.memoryProvider.apiKeyEnvVar
+                ] || '',
               agentId: group.memoryProvider.agentId,
             }
           : undefined,
@@ -691,6 +704,7 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    allAgents: () => [...agentsByFolder.values()],
   };
 
   // Create and connect all registered channels.
@@ -708,6 +722,18 @@ async function main(): Promise<void> {
     }
     channels.push(channel);
     await channel.connect();
+
+    // Populate triage context with bot user ID → agent folder mappings
+    if (channel.getBotUserMappings) {
+      const ctx = getTriageContext();
+      for (const [botUserId, agentFolder] of channel.getBotUserMappings()) {
+        ctx.botUserIds.set(botUserId, agentFolder);
+      }
+      logger.info(
+        { botUserMappings: Object.fromEntries(ctx.botUserIds) },
+        'Triage bot user mappings loaded',
+      );
+    }
   }
   if (channels.length === 0) {
     logger.fatal('No channels connected');

@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:container-check",
+    "build:container-check": "cd container/agent-runner && npm install --ignore-scripts --silent 2>/dev/null && npx tsc --noEmit",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",

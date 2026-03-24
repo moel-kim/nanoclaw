@@ -71,26 +71,28 @@ server.tool(
   {
     content: z.string().describe('The content to remember'),
     metadata: z
-      .record(z.string())
+      .string()
       .optional()
-      .describe('Optional key-value metadata tags'),
+      .describe('Optional JSON metadata tags (e.g. {"topic": "market"})')
+      ,
   },
   async ({ content, metadata }) => {
     try {
+      const parsedMetadata = metadata ? JSON.parse(metadata) : undefined;
       let result: any;
       if (memoryType === 'mem0') {
         // mem0.ai API: POST /v1/memories/
         result = await memoryFetch('/memories/', 'POST', {
           messages: [{ role: 'user', content }],
           agent_id: agentId,
-          metadata,
+          metadata: parsedMetadata,
         });
       } else {
         // Custom API: POST /memories
         result = await memoryFetch('/memories', 'POST', {
           content,
           agent_id: agentId,
-          metadata,
+          metadata: parsedMetadata,
         });
       }
 

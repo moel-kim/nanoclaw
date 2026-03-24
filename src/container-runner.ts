@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -60,6 +61,48 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+/**
+ * Hash-based sync for agent-runner source.
+ * Computes a content hash of the source directory and only re-copies
+ * when the hash changes. Prevents stale cached source from causing
+ * container compile errors after code changes.
+ */
+function syncAgentRunnerSource(srcDir: string, destDir: string): void {
+  const hashFile = `${destDir}.hash`;
+
+  // Compute hash of source directory contents
+  const hash = crypto.createHash('sha256');
+  const files = fs.readdirSync(srcDir).sort();
+  for (const file of files) {
+    const filePath = path.join(srcDir, file);
+    if (fs.statSync(filePath).isFile()) {
+      hash.update(file);
+      hash.update(fs.readFileSync(filePath));
+    }
+  }
+  const currentHash = hash.digest('hex');
+
+  // Check if cached hash matches
+  let cachedHash = '';
+  try {
+    cachedHash = fs.readFileSync(hashFile, 'utf-8').trim();
+  } catch {
+    // No cached hash — first time or cleared
+  }
+
+  if (cachedHash === currentHash && fs.existsSync(destDir)) {
+    return; // Cache is fresh
+  }
+
+  // Re-copy source
+  if (fs.existsSync(destDir)) {
+    fs.rmSync(destDir, { recursive: true });
+  }
+  fs.cpSync(srcDir, destDir, { recursive: true });
+  fs.writeFileSync(hashFile, currentHash);
+  logger.info({ destDir }, 'Agent-runner source synced (hash changed)');
 }
 
 function buildVolumeMounts(
@@ -196,8 +239,8 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  if (fs.existsSync(agentRunnerSrc)) {
+    syncAgentRunnerSource(agentRunnerSrc, groupAgentRunnerDir);
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,

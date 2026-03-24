@@ -114,6 +114,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: returns botUserId → agentFolder mapping for triage @mention detection.
+  getBotUserMappings?(): Map<string, string>;
 }
 
 // Callback type that channels use to deliver inbound messages
