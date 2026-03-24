@@ -34,10 +34,14 @@ export class SlackChannel implements Channel {
   private app: App;
   private botUserId: string | undefined;
   private connected = false;
-  private outgoingQueue: Array<{ jid: string; text: string; thread_ts?: string }> = [];
+  private outgoingQueue: Array<{
+    jid: string;
+    text: string;
+    thread_ts?: string;
+  }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
-  private lastMessageTs = new Map<string, string>(); // jid → last user message ts (for reactions)
+  private lastMessageTs = new Map<string, string[]>(); // jid → queue of user message ts (for reactions)
 
   private opts: SlackChannelOpts;
 
@@ -97,9 +101,11 @@ export class SlackChannel implements Channel {
 
       const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
-      // Track last user message ts for reaction-based typing indicator
+      // Track user message ts queue for reaction-based typing indicator
       if (!isBotMessage) {
-        this.lastMessageTs.set(jid, msg.ts);
+        const tsQueue = this.lastMessageTs.get(jid) || [];
+        tsQueue.push(msg.ts);
+        this.lastMessageTs.set(jid, tsQueue);
       }
 
       let senderName: string;
@@ -163,7 +169,11 @@ export class SlackChannel implements Channel {
     await this.syncChannelMetadata();
   }
 
-  async sendMessage(jid: string, text: string, options?: { thread_ts?: string }): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    options?: { thread_ts?: string },
+  ): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
     const threadTs = options?.thread_ts;
 
@@ -179,7 +189,11 @@ export class SlackChannel implements Channel {
     try {
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text, thread_ts: threadTs });
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text,
+          thread_ts: threadTs,
+        });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
@@ -214,8 +228,12 @@ export class SlackChannel implements Channel {
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
-    const messageTs = this.lastMessageTs.get(jid);
-    if (!messageTs) return;
+    const tsQueue = this.lastMessageTs.get(jid);
+    const messageTs = tsQueue?.[0];
+    if (!messageTs) {
+      logger.debug({ jid, isTyping }, 'setTyping: no lastMessageTs, skipping');
+      return;
+    }
 
     try {
       if (isTyping) {
@@ -230,9 +248,10 @@ export class SlackChannel implements Channel {
           timestamp: messageTs,
           name: 'ai-loading',
         });
+        tsQueue?.shift(); // Advance to next message's reaction target
       }
-    } catch {
-      // Ignore errors — reaction may already exist or be removed
+    } catch (err) {
+      logger.warn({ jid, isTyping, messageTs, err }, 'setTyping reaction failed');
     }
   }
 

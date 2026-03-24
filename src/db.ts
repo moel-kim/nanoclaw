@@ -146,6 +146,67 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* column already exists */
   }
+
+  // Multi-agent migration: change registered_groups from jid PRIMARY KEY to (jid, folder) composite key
+  // Detect old schema by checking if jid is the sole primary key
+  try {
+    const tableInfo = database
+      .prepare(`PRAGMA table_info(registered_groups)`)
+      .all() as Array<{ name: string; pk: number }>;
+    const pkColumns = tableInfo.filter((c) => c.pk > 0);
+    const needsMigration =
+      pkColumns.length === 1 && pkColumns[0].name === 'jid';
+
+    if (needsMigration) {
+      database.exec(`
+        CREATE TABLE registered_groups_v2 (
+          jid TEXT NOT NULL,
+          folder TEXT NOT NULL,
+          name TEXT NOT NULL,
+          trigger_pattern TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          container_config TEXT,
+          requires_trigger INTEGER DEFAULT 1,
+          is_main INTEGER DEFAULT 0,
+          assistant_name TEXT,
+          slack_identity TEXT,
+          triage_keywords TEXT,
+          triage_description TEXT,
+          memory_provider TEXT,
+          PRIMARY KEY (jid, folder)
+        );
+        INSERT INTO registered_groups_v2 (jid, folder, name, trigger_pattern, added_at,
+          container_config, requires_trigger, is_main)
+          SELECT jid, folder, name, trigger_pattern, added_at,
+            container_config, requires_trigger, is_main
+          FROM registered_groups;
+        DROP TABLE registered_groups;
+        ALTER TABLE registered_groups_v2 RENAME TO registered_groups;
+        CREATE INDEX IF NOT EXISTS idx_rg_folder ON registered_groups(folder);
+        CREATE INDEX IF NOT EXISTS idx_rg_jid ON registered_groups(jid);
+      `);
+      logger.info('Migrated registered_groups to composite primary key (jid, folder)');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to migrate registered_groups schema');
+  }
+
+  // Add multi-agent columns if they don't exist (for DBs created after composite key migration)
+  for (const col of [
+    'assistant_name TEXT',
+    'slack_identity TEXT',
+    'triage_keywords TEXT',
+    'triage_description TEXT',
+    'memory_provider TEXT',
+  ]) {
+    try {
+      database.exec(
+        `ALTER TABLE registered_groups ADD COLUMN ${col}`,
+      );
+    } catch {
+      /* column already exists */
+    }
+  }
 }
 
 export function initDatabase(): void {
@@ -553,19 +614,8 @@ export function getRegisteredGroup(
   jid: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
   const row = db
-    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
-    .get(jid) as
-    | {
-        jid: string;
-        name: string;
-        folder: string;
-        trigger_pattern: string;
-        added_at: string;
-        container_config: string | null;
-        requires_trigger: number | null;
-        is_main: number | null;
-      }
-    | undefined;
+    .prepare('SELECT * FROM registered_groups WHERE jid = ? LIMIT 1')
+    .get(jid) as RegisteredGroupRow | undefined;
   if (!row) return undefined;
   if (!isValidGroupFolder(row.folder)) {
     logger.warn(
@@ -574,6 +624,52 @@ export function getRegisteredGroup(
     );
     return undefined;
   }
+  return rowToGroup(row) as RegisteredGroup & { jid: string };
+}
+
+export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+  if (!isValidGroupFolder(group.folder)) {
+    throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO registered_groups
+     (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main,
+      assistant_name, slack_identity, triage_keywords, triage_description, memory_provider)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    jid,
+    group.name,
+    group.folder,
+    group.trigger,
+    group.added_at,
+    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.isMain ? 1 : 0,
+    group.assistantName || null,
+    group.slackIdentity || null,
+    group.triageKeywords ? JSON.stringify(group.triageKeywords) : null,
+    group.triageDescription || null,
+    group.memoryProvider ? JSON.stringify(group.memoryProvider) : null,
+  );
+}
+
+interface RegisteredGroupRow {
+  jid: string;
+  name: string;
+  folder: string;
+  trigger_pattern: string;
+  added_at: string;
+  container_config: string | null;
+  requires_trigger: number | null;
+  is_main: number | null;
+  assistant_name: string | null;
+  slack_identity: string | null;
+  triage_keywords: string | null;
+  triage_description: string | null;
+  memory_provider: string | null;
+}
+
+function rowToGroup(row: RegisteredGroupRow): RegisteredGroup {
   return {
     jid: row.jid,
     name: row.name,
@@ -586,39 +682,26 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    assistantName: row.assistant_name || undefined,
+    slackIdentity: row.slack_identity || undefined,
+    triageKeywords: row.triage_keywords
+      ? JSON.parse(row.triage_keywords)
+      : undefined,
+    triageDescription: row.triage_description || undefined,
+    memoryProvider: row.memory_provider
+      ? JSON.parse(row.memory_provider)
+      : undefined,
   };
 }
 
-export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
-  if (!isValidGroupFolder(group.folder)) {
-    throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
-  }
-  db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    jid,
-    group.name,
-    group.folder,
-    group.trigger,
-    group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
-    group.isMain ? 1 : 0,
-  );
-}
-
+/**
+ * Legacy accessor: returns first agent per JID for backwards compat.
+ * Use buildAgentIndexes() for multi-agent support.
+ */
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
-  const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    trigger_pattern: string;
-    added_at: string;
-    container_config: string | null;
-    requires_trigger: number | null;
-    is_main: number | null;
-  }>;
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
     if (!isValidGroupFolder(row.folder)) {
@@ -628,20 +711,64 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       );
       continue;
     }
-    result[row.jid] = {
-      name: row.name,
-      folder: row.folder,
-      trigger: row.trigger_pattern,
-      added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
-      requiresTrigger:
-        row.requires_trigger === null ? undefined : row.requires_trigger === 1,
-      isMain: row.is_main === 1 ? true : undefined,
-    };
+    // First agent per JID wins (backwards compat)
+    if (!result[row.jid]) {
+      result[row.jid] = rowToGroup(row);
+    }
   }
   return result;
+}
+
+/** Returns all registered agents as a flat list with jid populated. */
+export function getAllAgents(): RegisteredGroup[] {
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
+  const result: RegisteredGroup[] = [];
+  for (const row of rows) {
+    if (!isValidGroupFolder(row.folder)) {
+      logger.warn(
+        { jid: row.jid, folder: row.folder },
+        'Skipping registered group with invalid folder',
+      );
+      continue;
+    }
+    result.push(rowToGroup(row));
+  }
+  return result;
+}
+
+/** Returns all agents listening on a specific JID. */
+export function getAgentsForJid(jid: string): RegisteredGroup[] {
+  const rows = db
+    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
+    .all(jid) as RegisteredGroupRow[];
+  return rows
+    .filter((row) => isValidGroupFolder(row.folder))
+    .map(rowToGroup);
+}
+
+/** Builds dual-index maps for fast lookup by folder and by JID. */
+export function buildAgentIndexes(): {
+  byFolder: Map<string, RegisteredGroup>;
+  byJid: Map<string, RegisteredGroup[]>;
+} {
+  const agents = getAllAgents();
+  const byFolder = new Map<string, RegisteredGroup>();
+  const byJid = new Map<string, RegisteredGroup[]>();
+
+  for (const agent of agents) {
+    byFolder.set(agent.folder, agent);
+    const jid = agent.jid!;
+    const existing = byJid.get(jid);
+    if (existing) {
+      existing.push(agent);
+    } else {
+      byJid.set(jid, [agent]);
+    }
+  }
+
+  return { byFolder, byJid };
 }
 
 // --- JSON migration ---

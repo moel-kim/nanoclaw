@@ -302,7 +302,6 @@ describe('GroupQueue', () => {
       'group1@g.us',
       {} as any,
       'container-1',
-      'test-group',
     );
 
     // Enqueue a task while container is active but NOT idle
@@ -342,7 +341,6 @@ describe('GroupQueue', () => {
       'group1@g.us',
       {} as any,
       'container-1',
-      'test-group',
     );
     queue.notifyIdle('group1@g.us');
 
@@ -381,7 +379,6 @@ describe('GroupQueue', () => {
       'group1@g.us',
       {} as any,
       'container-1',
-      'test-group',
     );
 
     // Container becomes idle
@@ -422,7 +419,6 @@ describe('GroupQueue', () => {
       'group1@g.us',
       {} as any,
       'container-1',
-      'test-group',
     );
 
     // sendMessage should return false — user messages must not go to task containers
@@ -455,7 +451,6 @@ describe('GroupQueue', () => {
       'group1@g.us',
       {} as any,
       'container-1',
-      'test-group',
     );
 
     const writeFileSync = vi.mocked(fs.default.writeFileSync);

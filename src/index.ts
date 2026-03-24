@@ -27,6 +27,7 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  buildAgentIndexes,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -65,9 +66,14 @@ export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
+// Dual agent index: byFolder for processing, byJid for message routing
+let agentsByFolder = new Map<string, RegisteredGroup>();
+let agentsByJid = new Map<string, RegisteredGroup[]>();
+// Legacy compat shim: first agent per JID (used by channels, IPC, etc.)
 let registeredGroups: Record<string, RegisteredGroup> = {};
+// Per-agent state, keyed by agentFolder
 let lastAgentTimestamp: Record<string, string> = {};
-let activeThreadTs: Record<string, string | undefined> = {};
+let threadTsQueue: Record<string, Array<string | undefined>> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
@@ -83,9 +89,19 @@ function loadState(): void {
     lastAgentTimestamp = {};
   }
   sessions = getAllSessions();
+
+  // Build dual agent indexes
+  const indexes = buildAgentIndexes();
+  agentsByFolder = indexes.byFolder;
+  agentsByJid = indexes.byJid;
+  // Legacy compat: first agent per JID
   registeredGroups = getAllRegisteredGroups();
+
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    {
+      agentCount: agentsByFolder.size,
+      jidCount: agentsByJid.size,
+    },
     'State loaded',
   );
 }
@@ -107,8 +123,20 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     return;
   }
 
-  registeredGroups[jid] = group;
-  setRegisteredGroup(jid, group);
+  const groupWithJid = { ...group, jid };
+  registeredGroups[jid] = groupWithJid;
+  setRegisteredGroup(jid, groupWithJid);
+
+  // Update dual indexes
+  agentsByFolder.set(group.folder, groupWithJid);
+  const existingForJid = agentsByJid.get(jid) || [];
+  const idx = existingForJid.findIndex((a) => a.folder === group.folder);
+  if (idx >= 0) {
+    existingForJid[idx] = groupWithJid;
+  } else {
+    existingForJid.push(groupWithJid);
+  }
+  agentsByJid.set(jid, existingForJid);
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
@@ -145,26 +173,29 @@ export function _setRegisteredGroups(
 }
 
 /**
- * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn.
+ * Process all pending messages for an agent.
+ * Called by the GroupQueue when it's this agent's turn.
+ * Keyed by agentFolder (not JID) to support multiple agents per channel.
  */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+async function processGroupMessages(agentFolder: string): Promise<boolean> {
+  const group = agentsByFolder.get(agentFolder);
   if (!group) return true;
 
+  const chatJid = group.jid!;
   const channel = findChannel(channels, chatJid);
   if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+    logger.warn({ chatJid, agentFolder }, 'No channel owns JID, skipping messages');
     return true;
   }
 
   const isMainGroup = group.isMain === true;
+  const agentName = group.assistantName || ASSISTANT_NAME;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  const sinceTimestamp = lastAgentTimestamp[agentFolder] || '';
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
-    ASSISTANT_NAME,
+    agentName,
   );
 
   if (missedMessages.length === 0) return true;
@@ -184,15 +215,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
+  const previousCursor = lastAgentTimestamp[agentFolder] || '';
+  lastAgentTimestamp[agentFolder] =
     missedMessages[missedMessages.length - 1].timestamp;
-  activeThreadTs[chatJid] =
-    missedMessages[missedMessages.length - 1].thread_ts;
+  (threadTsQueue[agentFolder] ??= []).push(
+    missedMessages[missedMessages.length - 1].thread_ts,
+  );
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, agentFolder, messageCount: missedMessages.length },
     'Processing messages',
   );
 
@@ -206,7 +238,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Idle timeout, closing container stdin',
       );
-      queue.closeStdin(chatJid);
+      queue.closeStdin(agentFolder);
     }, IDLE_TIMEOUT);
   };
 
@@ -225,11 +257,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text, { thread_ts: activeThreadTs[chatJid] });
-        if (!outputSentToUser) {
-          // Remove loading indicator after first response is sent
-          await channel.setTyping?.(chatJid, false);
-        }
+        await channel.sendMessage(chatJid, text, {
+          thread_ts: threadTsQueue[agentFolder]?.[0],
+          agentFolder,
+        });
+        // Remove loading indicator after response is sent
+        await channel.setTyping?.(chatJid, false);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -237,14 +270,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
+      threadTsQueue[agentFolder]?.shift();
+      queue.notifyIdle(agentFolder);
     }
 
     if (result.status === 'error') {
+      threadTsQueue[agentFolder]?.shift();
       hadError = true;
     }
   });
 
+  threadTsQueue[agentFolder] = []; // Clear queue — container exited
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
@@ -259,7 +295,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
     // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    lastAgentTimestamp[agentFolder] = previousCursor;
     saveState();
     logger.warn(
       { group: group.name },
@@ -328,7 +364,7 @@ async function runAgent(
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+        queue.registerProcess(group.folder, proc, containerName),
       wrappedOnOutput,
     );
 
@@ -363,7 +399,7 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
+      const jids = [...agentsByJid.keys()];
       const { messages, newTimestamp } = getNewMessages(
         jids,
         lastTimestamp,
@@ -389,8 +425,8 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
+          const agents = agentsByJid.get(chatJid);
+          if (!agents || agents.length === 0) continue;
 
           const channel = findChannel(channels, chatJid);
           if (!channel) {
@@ -398,53 +434,63 @@ async function startMessageLoop(): Promise<void> {
             continue;
           }
 
-          const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          // Dispatch to each agent registered for this JID
+          for (const agent of agents) {
+            const agentFolder = agent.folder;
+            const isMainGroup = agent.isMain === true;
+            const needsTrigger =
+              !isMainGroup && agent.requiresTrigger !== false;
+            const agentName = agent.assistantName || ASSISTANT_NAME;
 
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            activeThreadTs[chatJid] =
-              messagesToSend[messagesToSend.length - 1].thread_ts;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+            // For non-main groups, only act on trigger messages.
+            // Non-trigger messages accumulate in DB and get pulled as
+            // context when a trigger eventually arrives.
+            if (needsTrigger) {
+              const allowlistCfg = loadSenderAllowlist();
+              const hasTrigger = groupMessages.some(
+                (m) =>
+                  TRIGGER_PATTERN.test(m.content.trim()) &&
+                  (m.is_from_me ||
+                    isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
               );
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+              if (!hasTrigger) continue;
+            }
+
+            // Pull all messages since this agent's lastAgentTimestamp so non-trigger
+            // context that accumulated between triggers is included.
+            const allPending = getMessagesSince(
+              chatJid,
+              lastAgentTimestamp[agentFolder] || '',
+              agentName,
+            );
+            const messagesToSend =
+              allPending.length > 0 ? allPending : groupMessages;
+            const formatted = formatMessages(messagesToSend, TIMEZONE);
+
+            if (queue.sendMessage(agentFolder, formatted)) {
+              logger.debug(
+                { chatJid, agentFolder, count: messagesToSend.length },
+                'Piped messages to active container',
+              );
+              lastAgentTimestamp[agentFolder] =
+                messagesToSend[messagesToSend.length - 1].timestamp;
+              (threadTsQueue[agentFolder] ??= []).push(
+                messagesToSend[messagesToSend.length - 1].thread_ts,
+              );
+              saveState();
+              // Show typing indicator while the container processes the piped message
+              channel
+                .setTyping?.(chatJid, true)
+                ?.catch((err) =>
+                  logger.warn(
+                    { chatJid, err },
+                    'Failed to set typing indicator',
+                  ),
+                );
+            } else {
+              // No active container — enqueue for a new one
+              queue.enqueueMessageCheck(agentFolder);
+            }
           }
         }
       }
@@ -460,15 +506,17 @@ async function startMessageLoop(): Promise<void> {
  * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
-  for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+  for (const [agentFolder, agent] of agentsByFolder) {
+    const chatJid = agent.jid!;
+    const agentName = agent.assistantName || ASSISTANT_NAME;
+    const sinceTimestamp = lastAgentTimestamp[agentFolder] || '';
+    const pending = getMessagesSince(chatJid, sinceTimestamp, agentName);
     if (pending.length > 0) {
       logger.info(
-        { group: group.name, pendingCount: pending.length },
+        { group: agent.name, agentFolder, pendingCount: pending.length },
         'Recovery: found unprocessed messages',
       );
-      queue.enqueueMessageCheck(chatJid);
+      queue.enqueueMessageCheck(agentFolder);
     }
   }
 }
@@ -610,8 +658,8 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    onProcess: (_groupJid, proc, containerName, groupFolder) =>
+      queue.registerProcess(groupFolder || _groupJid, proc, containerName),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
@@ -623,10 +671,17 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: async (jid, text, sourceFolder) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text, { thread_ts: activeThreadTs[jid] });
+      // Use source agent's folder for thread context and identity
+      const folder = sourceFolder || agentsByJid.get(jid)?.[0]?.folder;
+      await channel.sendMessage(jid, text, {
+        thread_ts: folder ? threadTsQueue[folder]?.[0] : undefined,
+        agentFolder: folder,
+      });
+      // Remove loading reaction after sending a response
+      await channel.setTyping?.(jid, false);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
