@@ -63,6 +63,11 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import {
+  extractSessionCommand,
+  handleSessionCommand,
+  isSessionCommandAllowed,
+} from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
   CascadeTriageStrategy,
@@ -307,6 +312,43 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
+  // --- Session command interception (before trigger check) ---
+  const cmdResult = await handleSessionCommand({
+    missedMessages,
+    isMainGroup,
+    groupName: group.name,
+    triggerPattern: getTriggerPattern(group.trigger),
+    timezone: TIMEZONE,
+    deps: {
+      sendMessage: (text) => channel.sendMessage(chatJid, text),
+      setTyping: (typing) =>
+        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      runAgent: (prompt, onOutput) =>
+        runAgent(group, prompt, chatJid, onOutput),
+      closeStdin: () => queue.closeStdin(chatJid),
+      advanceCursor: (ts) => {
+        lastAgentTimestamp[chatJid] = ts;
+        saveState();
+      },
+      formatMessages,
+      canSenderInteract: (msg) => {
+        const hasTrigger = getTriggerPattern(group.trigger).test(
+          msg.content.trim(),
+        );
+        const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
+        return (
+          isMainGroup ||
+          !reqTrigger ||
+          (hasTrigger &&
+            (msg.is_from_me ||
+              isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+        );
+      },
+    },
+  });
+  if (cmdResult.handled) return cmdResult.success;
+  // --- End session command interception ---
+
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const triggerPattern = getTriggerPattern(group.trigger);
@@ -325,7 +367,9 @@ async function processGroupMessages(agentFolder: string): Promise<boolean> {
           agentTriggerPattern?.test(m.content.trim())) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
-    if (!hasTrigger) return true;
+    if (!hasTrigger) {
+      return true;
+    }
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
@@ -588,6 +632,35 @@ async function startMessageLoop(): Promise<void> {
             logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
             continue;
           }
+
+          // --- Session command interception (message loop) ---
+          // Scan ALL messages in the batch for a session command.
+          // Use the first agent's trigger pattern for command extraction.
+          const sessionCmdTrigger = getTriggerPattern(agents[0]?.trigger);
+          const loopCmdMsg = groupMessages.find(
+            (m) => extractSessionCommand(m.content, sessionCmdTrigger) !== null,
+          );
+
+          if (loopCmdMsg) {
+            const isMainForCmd = agents.some((a) => a.isMain === true);
+            // Only close active container if the sender is authorized — otherwise an
+            // untrusted user could kill in-flight work by sending /compact (DoS).
+            // closeStdin no-ops internally when no container is active.
+            if (
+              isSessionCommandAllowed(
+                isMainForCmd,
+                loopCmdMsg.is_from_me === true,
+              )
+            ) {
+              queue.closeStdin(chatJid);
+            }
+            // Enqueue so processGroupMessages handles auth + cursor advancement.
+            // Don't pipe via IPC — slash commands need a fresh container with
+            // string prompt (not MessageStream) for SDK recognition.
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
+          // --- End session command interception ---
 
           // Determine which agents should handle these messages
           let targetAgents: RegisteredGroup[];
@@ -875,7 +948,7 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: async (jid, text, sourceFolder) => {
+    sendMessage: async (jid: string, text: string, sourceFolder?: string) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       // Use source agent's folder for thread context and identity
