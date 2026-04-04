@@ -9,6 +9,8 @@ export interface ChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  /** All agents across all JIDs (for multi-agent features like identity mapping). */
+  allAgents?: () => RegisteredGroup[];
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;
