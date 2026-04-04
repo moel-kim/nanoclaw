@@ -746,8 +746,7 @@ async function main(): Promise<void> {
     }
   }
   if (channels.length === 0) {
-    logger.fatal('No channels connected');
-    process.exit(1);
+    logger.warn('No channels connected — running in container-only mode (IPC/scheduler)');
   }
 
   // Start subsystems (independently of connection handler)
