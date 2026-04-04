@@ -62,7 +62,12 @@ describe('proxy-executor', () => {
           (): Promise<ContainerOutput> =>
             new Promise((resolve) =>
               setTimeout(
-                () => resolve({ status: 'success', result: 'late', newSessionId: undefined }),
+                () =>
+                  resolve({
+                    status: 'success',
+                    result: 'late',
+                    newSessionId: undefined,
+                  }),
                 500,
               ),
             ),

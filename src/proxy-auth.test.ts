@@ -78,7 +78,12 @@ describe('proxy-auth', () => {
       const body = '{"group":"test"}';
       const sig = signRequest(ts, body, TEST_SECRET);
 
-      const result = verifyRequest(ts, '{"group":"tampered"}', sig, TEST_CONFIG);
+      const result = verifyRequest(
+        ts,
+        '{"group":"tampered"}',
+        sig,
+        TEST_CONFIG,
+      );
       expect(result.valid).toBe(false);
     });
 

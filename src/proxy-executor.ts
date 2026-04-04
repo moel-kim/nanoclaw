@@ -70,10 +70,7 @@ export async function executeSpecialist(
         );
       }),
       new Promise<never>((_resolve, reject) =>
-        setTimeout(
-          () => reject(new Error('proxy_timeout')),
-          timeoutMs,
-        ),
+        setTimeout(() => reject(new Error('proxy_timeout')), timeoutMs),
       ),
     ]);
 
@@ -87,8 +84,7 @@ export async function executeSpecialist(
       error: result.error,
     };
   } catch (err) {
-    const isTimeout =
-      err instanceof Error && err.message === 'proxy_timeout';
+    const isTimeout = err instanceof Error && err.message === 'proxy_timeout';
 
     if (isTimeout) {
       return {

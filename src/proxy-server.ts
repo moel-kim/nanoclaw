@@ -83,7 +83,9 @@ function authenticateRequest(
   req: http.IncomingMessage,
   body: string,
   deps: ServerDeps,
-): { ok: true } | { ok: false; status: number; error: string; message: string } {
+):
+  | { ok: true }
+  | { ok: false; status: number; error: string; message: string } {
   const keyId = req.headers['x-nanoclaw-key-id'] as string | undefined;
   const timestamp = req.headers['x-nanoclaw-timestamp'] as string | undefined;
   const signature = req.headers['x-nanoclaw-signature'] as string | undefined;

@@ -14,7 +14,10 @@ export function signRequest(
   secret: string,
 ): string {
   const signingString = `${timestamp}\n${body}`;
-  return crypto.createHmac('sha256', secret).update(signingString).digest('hex');
+  return crypto
+    .createHmac('sha256', secret)
+    .update(signingString)
+    .digest('hex');
 }
 
 /**
