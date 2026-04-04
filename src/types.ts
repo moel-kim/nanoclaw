@@ -40,6 +40,20 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  // Multi-agent fields (all optional for backwards compat)
+  jid?: string; // Chat JID this agent listens to (populated from DB key)
+  assistantName?: string; // Per-agent name (fallback: global ASSISTANT_NAME)
+  slackIdentity?: string; // Suffix key for .env tokens: SLACK_BOT_TOKEN_<KEY>
+  triageKeywords?: string[]; // Fast-path keywords for triage routing
+  triageDescription?: string; // Domain description for LLM triage
+  memoryProvider?: MemoryProviderConfig;
+}
+
+export interface MemoryProviderConfig {
+  type: 'mem0' | 'custom';
+  apiUrl: string;
+  apiKeyEnvVar: string; // .env var name containing the API key
+  agentId?: string; // Namespace within the memory service
 }
 
 export interface NewMessage {
@@ -51,6 +65,11 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  thread_ts?: string;
+  thread_id?: string;
+  reply_to_message_id?: string;
+  reply_to_message_content?: string;
+  reply_to_sender_name?: string;
 }
 
 export interface ScheduledTask {
@@ -58,6 +77,7 @@ export interface ScheduledTask {
   group_folder: string;
   chat_jid: string;
   prompt: string;
+  script?: string | null;
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
   context_mode: 'group' | 'isolated';
@@ -79,10 +99,19 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+export interface SendMessageOptions {
+  thread_ts?: string;
+  agentFolder?: string; // Which agent identity to send as (for multi-identity channels)
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(
+    jid: string,
+    text: string,
+    options?: SendMessageOptions,
+  ): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -90,6 +119,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: returns botUserId → agentFolder mapping for triage @mention detection.
+  getBotUserMappings?(): Map<string, string>;
 }
 
 // Callback type that channels use to deliver inbound messages

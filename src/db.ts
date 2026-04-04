@@ -93,6 +93,13 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add script column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN script TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -134,10 +141,89 @@ function createSchema(database: Database.Database): void {
       `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
     );
     database.exec(
-      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
+      `UPDATE chats SET channel = 'telegram', is_group = 0 WHERE jid LIKE 'tg:%'`,
     );
   } catch {
     /* columns already exist */
+  }
+
+  // Add reply context columns if they don't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT`);
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN reply_to_message_content TEXT`,
+    );
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`);
+  } catch {
+    /* columns already exist */
+  }
+
+  // Add thread_ts column for Slack thread reply support
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN thread_ts TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Multi-agent migration: change registered_groups from jid PRIMARY KEY to (jid, folder) composite key
+  // Detect old schema by checking if jid is the sole primary key
+  try {
+    const tableInfo = database
+      .prepare(`PRAGMA table_info(registered_groups)`)
+      .all() as Array<{ name: string; pk: number }>;
+    const pkColumns = tableInfo.filter((c) => c.pk > 0);
+    const needsMigration =
+      pkColumns.length === 1 && pkColumns[0].name === 'jid';
+
+    if (needsMigration) {
+      database.exec(`
+        CREATE TABLE registered_groups_v2 (
+          jid TEXT NOT NULL,
+          folder TEXT NOT NULL,
+          name TEXT NOT NULL,
+          trigger_pattern TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          container_config TEXT,
+          requires_trigger INTEGER DEFAULT 1,
+          is_main INTEGER DEFAULT 0,
+          assistant_name TEXT,
+          slack_identity TEXT,
+          triage_keywords TEXT,
+          triage_description TEXT,
+          memory_provider TEXT,
+          PRIMARY KEY (jid, folder)
+        );
+        INSERT INTO registered_groups_v2 (jid, folder, name, trigger_pattern, added_at,
+          container_config, requires_trigger, is_main)
+          SELECT jid, folder, name, trigger_pattern, added_at,
+            container_config, requires_trigger, is_main
+          FROM registered_groups;
+        DROP TABLE registered_groups;
+        ALTER TABLE registered_groups_v2 RENAME TO registered_groups;
+        CREATE INDEX IF NOT EXISTS idx_rg_folder ON registered_groups(folder);
+        CREATE INDEX IF NOT EXISTS idx_rg_jid ON registered_groups(jid);
+      `);
+      logger.info(
+        'Migrated registered_groups to composite primary key (jid, folder)',
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to migrate registered_groups schema');
+  }
+
+  // Add multi-agent columns if they don't exist (for DBs created after composite key migration)
+  for (const col of [
+    'assistant_name TEXT',
+    'slack_identity TEXT',
+    'triage_keywords TEXT',
+    'triage_description TEXT',
+    'memory_provider TEXT',
+  ]) {
+    try {
+      database.exec(`ALTER TABLE registered_groups ADD COLUMN ${col}`);
+    } catch {
+      /* column already exists */
+    }
   }
 }
 
@@ -156,6 +242,11 @@ export function initDatabase(): void {
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
+}
+
+/** @internal - for tests only. */
+export function _closeDatabase(): void {
+  db.close();
 }
 
 /**
@@ -262,7 +353,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, thread_ts, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -272,6 +363,10 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.thread_ts || null,
+    msg.reply_to_message_id ?? null,
+    msg.reply_to_message_content ?? null,
+    msg.reply_to_sender_name ?? null,
   );
 }
 
@@ -287,9 +382,10 @@ export function storeMessageDirect(msg: {
   timestamp: string;
   is_from_me: boolean;
   is_bot_message?: boolean;
+  thread_ts?: string;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, thread_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -299,6 +395,7 @@ export function storeMessageDirect(msg: {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.thread_ts || null,
   );
 }
 
@@ -316,7 +413,8 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, thread_ts,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -349,7 +447,8 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, thread_ts,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -363,19 +462,33 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
+export function getLastBotMessageTimestamp(
+  chatJid: string,
+  botPrefix: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      `SELECT MAX(timestamp) as ts FROM messages
+       WHERE chat_jid = ? AND (is_bot_message = 1 OR content LIKE ?)`,
+    )
+    .get(chatJid, `${botPrefix}:%`) as { ts: string | null } | undefined;
+  return row?.ts ?? undefined;
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
     task.group_folder,
     task.chat_jid,
     task.prompt,
+    task.script || null,
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'isolated',
@@ -410,7 +523,12 @@ export function updateTask(
   updates: Partial<
     Pick<
       ScheduledTask,
-      'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status'
+      | 'prompt'
+      | 'script'
+      | 'schedule_type'
+      | 'schedule_value'
+      | 'next_run'
+      | 'status'
     >
   >,
 ): void {
@@ -420,6 +538,10 @@ export function updateTask(
   if (updates.prompt !== undefined) {
     fields.push('prompt = ?');
     values.push(updates.prompt);
+  }
+  if (updates.script !== undefined) {
+    fields.push('script = ?');
+    values.push(updates.script || null);
   }
   if (updates.schedule_type !== undefined) {
     fields.push('schedule_type = ?');
@@ -526,6 +648,10 @@ export function setSession(groupFolder: string, sessionId: string): void {
   ).run(groupFolder, sessionId);
 }
 
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
 export function getAllSessions(): Record<string, string> {
   const rows = db
     .prepare('SELECT group_folder, session_id FROM sessions')
@@ -543,19 +669,8 @@ export function getRegisteredGroup(
   jid: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
   const row = db
-    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
-    .get(jid) as
-    | {
-        jid: string;
-        name: string;
-        folder: string;
-        trigger_pattern: string;
-        added_at: string;
-        container_config: string | null;
-        requires_trigger: number | null;
-        is_main: number | null;
-      }
-    | undefined;
+    .prepare('SELECT * FROM registered_groups WHERE jid = ? LIMIT 1')
+    .get(jid) as RegisteredGroupRow | undefined;
   if (!row) return undefined;
   if (!isValidGroupFolder(row.folder)) {
     logger.warn(
@@ -564,6 +679,52 @@ export function getRegisteredGroup(
     );
     return undefined;
   }
+  return rowToGroup(row) as RegisteredGroup & { jid: string };
+}
+
+export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+  if (!isValidGroupFolder(group.folder)) {
+    throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO registered_groups
+     (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main,
+      assistant_name, slack_identity, triage_keywords, triage_description, memory_provider)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    jid,
+    group.name,
+    group.folder,
+    group.trigger,
+    group.added_at,
+    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.isMain ? 1 : 0,
+    group.assistantName || null,
+    group.slackIdentity || null,
+    group.triageKeywords ? JSON.stringify(group.triageKeywords) : null,
+    group.triageDescription || null,
+    group.memoryProvider ? JSON.stringify(group.memoryProvider) : null,
+  );
+}
+
+interface RegisteredGroupRow {
+  jid: string;
+  name: string;
+  folder: string;
+  trigger_pattern: string;
+  added_at: string;
+  container_config: string | null;
+  requires_trigger: number | null;
+  is_main: number | null;
+  assistant_name: string | null;
+  slack_identity: string | null;
+  triage_keywords: string | null;
+  triage_description: string | null;
+  memory_provider: string | null;
+}
+
+function rowToGroup(row: RegisteredGroupRow): RegisteredGroup {
   return {
     jid: row.jid,
     name: row.name,
@@ -576,39 +737,26 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    assistantName: row.assistant_name || undefined,
+    slackIdentity: row.slack_identity || undefined,
+    triageKeywords: row.triage_keywords
+      ? JSON.parse(row.triage_keywords)
+      : undefined,
+    triageDescription: row.triage_description || undefined,
+    memoryProvider: row.memory_provider
+      ? JSON.parse(row.memory_provider)
+      : undefined,
   };
 }
 
-export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
-  if (!isValidGroupFolder(group.folder)) {
-    throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
-  }
-  db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    jid,
-    group.name,
-    group.folder,
-    group.trigger,
-    group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
-    group.isMain ? 1 : 0,
-  );
-}
-
+/**
+ * Legacy accessor: returns first agent per JID for backwards compat.
+ * Use buildAgentIndexes() for multi-agent support.
+ */
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
-  const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    trigger_pattern: string;
-    added_at: string;
-    container_config: string | null;
-    requires_trigger: number | null;
-    is_main: number | null;
-  }>;
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
     if (!isValidGroupFolder(row.folder)) {
@@ -618,20 +766,62 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       );
       continue;
     }
-    result[row.jid] = {
-      name: row.name,
-      folder: row.folder,
-      trigger: row.trigger_pattern,
-      added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
-      requiresTrigger:
-        row.requires_trigger === null ? undefined : row.requires_trigger === 1,
-      isMain: row.is_main === 1 ? true : undefined,
-    };
+    // First agent per JID wins (backwards compat)
+    if (!result[row.jid]) {
+      result[row.jid] = rowToGroup(row);
+    }
   }
   return result;
+}
+
+/** Returns all registered agents as a flat list with jid populated. */
+export function getAllAgents(): RegisteredGroup[] {
+  const rows = db
+    .prepare('SELECT * FROM registered_groups')
+    .all() as RegisteredGroupRow[];
+  const result: RegisteredGroup[] = [];
+  for (const row of rows) {
+    if (!isValidGroupFolder(row.folder)) {
+      logger.warn(
+        { jid: row.jid, folder: row.folder },
+        'Skipping registered group with invalid folder',
+      );
+      continue;
+    }
+    result.push(rowToGroup(row));
+  }
+  return result;
+}
+
+/** Returns all agents listening on a specific JID. */
+export function getAgentsForJid(jid: string): RegisteredGroup[] {
+  const rows = db
+    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
+    .all(jid) as RegisteredGroupRow[];
+  return rows.filter((row) => isValidGroupFolder(row.folder)).map(rowToGroup);
+}
+
+/** Builds dual-index maps for fast lookup by folder and by JID. */
+export function buildAgentIndexes(): {
+  byFolder: Map<string, RegisteredGroup>;
+  byJid: Map<string, RegisteredGroup[]>;
+} {
+  const agents = getAllAgents();
+  const byFolder = new Map<string, RegisteredGroup>();
+  const byJid = new Map<string, RegisteredGroup[]>();
+
+  for (const agent of agents) {
+    byFolder.set(agent.folder, agent);
+    const jid = agent.jid!;
+    const existing = byJid.get(jid);
+    if (existing) {
+      existing.push(agent);
+    } else {
+      byJid.set(jid, [agent]);
+    }
+  }
+
+  return { byFolder, byJid };
 }
 
 // --- JSON migration ---
